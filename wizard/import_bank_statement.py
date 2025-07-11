@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+###############################################################################
+#
+#    Cybrosys Technologies Pvt. Ltd.
+#
+#    Copyright (C) 2024-TODAY Cybrosys Technologies(<https://www.cybrosys.com>)
+#    Author: Akhil Ashok (odoo@cybrosys.com)
+#
+#    You can modify it under the terms of the GNU LESSER
+#    GENERAL PUBLIC LICENSE (LGPL v3), Version 3.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU LESSER GENERAL PUBLIC LICENSE (LGPL v3) for more details.
+#
+#    You should have received a copy of the GNU LESSER GENERAL PUBLIC LICENSE
+#    (LGPL v3) along with this program.
+#    If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+import base64
+import csv
+import os
+from datetime import datetime
+from io import StringIO
+from odoo import fields, models, _
+from odoo.exceptions import ValidationError
+
+
+class ImportBankStatement(models.TransientModel):
+    _name = "import.bank.statement"
+    _description = "Import button"
+    _rec_name = "file_name"
+
+    attachment = fields.Binary(string="Файл", required=True)
+    file_name = fields.Char(string="Название файла")
+    journal_id = fields.Many2one('account.journal', string="ID журнала")
+
+    def action_statement_import(self):
+        split_tup = os.path.splitext(self.file_name)
+        if split_tup[1] != '.txt':
+            raise ValidationError(_("Поддерживаются только TXT файлы"))
+        
+        try:
+            file_content = base64.b64decode(self.attachment)
+            file_string = file_content.decode('cp866')
+            rows = self._parse_txt_statement(file_string)
+        except Exception as e:
+            raise ValidationError(_("Ошибка при прочтении TXT файла: %s") % str(e))
+        
+        statements_created = []
+        duplicates = 0
+        # sort rows by ascending date
+        rows.sort(key=lambda x:x['date'])
+        
+        for row in rows:
+            try:
+                # extract required fields from the csv structure
+                transaction_date = datetime.strptime(row['date'], '%y%m%d').date() if row.get('date') else fields.date.today()
+                amount = float(row['sum_byn'].replace(',', '.')) if row.get('sum_byn') else 0.0
+                currency = row.get('currency', '')
+                beneficiary_account = row.get('beneficiary_account', '')
+                beneficiary_bank_code = row.get('beneficiary_bank_code', '')
+                payment_purpose = row.get('payment_purpose', '')
+                document_id = row.get('document_id', '')
+
+                existing_line = self.env['account.bank.statement.line'].search([
+                    ('date', '=', transaction_date),
+                    ('amount', '=', amount),
+                    ('narration', 'ilike', beneficiary_account)
+                ])
+
+                if document_id and existing_line:
+                    existing_line = existing_line.filtered(
+                        lambda l: document_id in (l.payment_ref or '')
+                    )
+
+                previous_statement = self.env['account.bank.statement'].search(
+                    [
+                        ('journal_id', '=', self.journal_id.id),
+                        ('date', '<', transaction_date)
+                    ],
+                    limit=1,
+                    order='first_line_index DESC',
+                )
+                balance_end = previous_statement.balance_end or 0.0
+                #print(transaction_date, previous_statement.date, previous_statement.balance_start, balance_start)
+                                                
+                if existing_line:
+                    duplicates += 1
+                    continue  # skip this transaction 
+                
+                # determine if debit or credit
+                if row.get('debit_credit') == '1':  # assuming 1 = debit, 0 = credit
+                    amount = -abs(amount)
+                else:
+                    amount = abs(amount)
+                
+                # find or create partner bank account
+                partner_bank = self.env['res.partner.bank'].search([
+                    ('acc_number', '=', beneficiary_account)
+                ], limit=1)
+                
+                if not partner_bank:
+                    # create a generic partner if none exists
+                    partner_name = f"Партнёр {beneficiary_account}"
+                    try:
+                        partner = self.env['res.partner'].create({
+                            'name': partner_name,
+                            'is_company': True,
+                            'supplier_rank': 1,
+                        })
+
+                        print(partner.id)
+                        
+                        # create the bank account
+                        partner_bank = self.env['res.partner.bank'].create({
+                            'acc_number': beneficiary_account,
+                            'partner_id': partner.id,
+                            'bank_name': beneficiary_bank_code or 'Неизвестный банк',
+                            'journal_id': None
+                        })
+
+                        print(partner_bank)
+                    except Exception as e:
+                        raise ValidationError(_(e))
+                
+                partner_id = partner_bank.partner_id.id
+                
+                # create bank statement
+                statement = self.env['account.bank.statement'].create({
+                    'name': f"Импорт {beneficiary_account}",
+                    'balance_start': balance_end,
+                    'line_ids': [
+                        (0, 0, {
+                            'date': transaction_date,
+                            'payment_ref': f"{document_id} - {payment_purpose}" or 'csv import',
+                            'partner_id': partner_id,
+                            'journal_id': self.journal_id.id,
+                            'amount': amount,
+                            'narration': f"Валюта: {currency}, Аккаунт: {beneficiary_account}",
+                        }),
+                    ],
+                })
+                statement._compute_balance_end()
+                statements_created.append(statement.id)
+                
+            except (ValueError, KeyError) as e:
+                print(e)
+                continue  # skip malformed rows
+
+        if duplicates > 0:
+            raise ValidationError(_("Найдено %d дубликатов. Импорт отменён") % duplicates)
+        
+        if not statements_created:
+            raise ValidationError(_("Не найдены верные транзакции в файле"))
+        
+        return {
+            'type': 'ir.actions.act_window',
+            'name': 'Импортированная выписка',
+            'view_mode': 'tree',
+            'res_model': 'account.bank.statement',
+            'domain': [('id', 'in', statements_created)],
+        }
+
+    def _parse_txt_statement(self, statement):
+        transactions = []
+        for line in statement.splitlines():
+            # first column always empty
+            columns = line.split('*')[1:]
+            colType = int(columns[0])
+            #print(colType)
+        
+            if colType == 1:
+                data = {
+                    #"type": colType,
+                    "date": columns[1],
+                    "client_account": columns[2],
+                    "currency": columns[3],
+                    "beneficiary_bank_code": columns[4],
+                    "beneficiary_account": columns[5],
+                    "beneficiary_currency": columns[6],
+                    "payment_purpose_code": columns[7],
+                    "payment_code": columns[8],
+                    "reserved": columns[9],
+                    "document_type": columns[10],
+                    "document_id": columns[11],
+                    "payer_tax_id": columns[12],
+                    "tax_id_of_whom_paid": columns[13],
+                    "debit_credit": columns[14],
+                    "sum": columns[15],
+                    "exchange_rate": columns[16],
+                    "sum_byn": columns[17],
+                    "payment_purpose": columns[18]
+                }
+                transactions.append(data)
+
+        return transactions
