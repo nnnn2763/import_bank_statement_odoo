@@ -40,12 +40,16 @@ class ImportBankStatement(models.TransientModel):
     def action_statement_import(self):
         split_tup = os.path.splitext(self.file_name)
         if split_tup[1] != '.txt':
-            raise ValidationError(_("Поддерживаются только TXT файлы"))
+            raise ValidationError(_("Поддерживаются только TXT файлы или выписки формата SWIFT"))
         
         try:
             file_content = base64.b64decode(self.attachment)
             file_string = file_content.decode('cp866')
-            rows = self._parse_txt_statement(file_string)
+            kind = self._detect_statement_type(file_string)
+            if kind == 'txt':
+                rows = self._parse_txt_statement(file_string)
+            elif kind == 'swift':
+                rows = self._parse_swift_statement(file_string)
         except Exception as e:
             raise ValidationError(_("Ошибка при прочтении TXT файла: %s") % str(e))
         
@@ -62,6 +66,7 @@ class ImportBankStatement(models.TransientModel):
                 currency = row.get('currency', '')
                 beneficiary_account = row.get('beneficiary_account', '')
                 beneficiary_bank_code = row.get('beneficiary_bank_code', '')
+                beneficiary_name = row.get('beneficiary_name', '')
                 payment_purpose = row.get('payment_purpose', '')
                 document_id = row.get('document_id', '')
 
@@ -76,15 +81,7 @@ class ImportBankStatement(models.TransientModel):
                         lambda l: document_id in (l.payment_ref or '')
                     )
 
-                previous_statement = self.env['account.bank.statement'].search(
-                    [
-                        ('journal_id', '=', self.journal_id.id),
-                        ('date', '<', transaction_date)
-                    ],
-                    limit=1,
-                    order='first_line_index DESC',
-                )
-                balance_end = previous_statement.balance_end or 0.0
+                
                 #print(transaction_date, previous_statement.date, previous_statement.balance_start, balance_start)
                                                 
                 if existing_line:
@@ -104,7 +101,12 @@ class ImportBankStatement(models.TransientModel):
                 
                 if not partner_bank:
                     # create a generic partner if none exists
-                    partner_name = f"Партнёр {beneficiary_account}"
+
+                    if beneficiary_name != "":
+                        partner_name = beneficiary_name
+                    else:
+                        partner_name = f"Партнёр {beneficiary_account}"
+                    
                     try:
                         partner = self.env['res.partner'].create({
                             'name': partner_name,
@@ -131,7 +133,7 @@ class ImportBankStatement(models.TransientModel):
                 # create bank statement
                 statement = self.env['account.bank.statement'].create({
                     'name': f"Импорт {beneficiary_account}",
-                    'balance_start': balance_end,
+                    #'balance_start': balance_end,
                     'line_ids': [
                         (0, 0, {
                             'date': transaction_date,
@@ -143,6 +145,17 @@ class ImportBankStatement(models.TransientModel):
                         }),
                     ],
                 })
+                previous_statement = self.env['account.bank.statement'].search(
+                    [
+                        ('journal_id', '=', self.journal_id.id),
+                        ('first_line_index', '<', statement.first_line_index)
+                    ],
+                    limit=1,
+                    order='first_line_index DESC',
+                )
+                balance_end = previous_statement.balance_end_real or 0.0
+                statement.balance_start = balance_end
+                
                 statement._compute_balance_end()
                 statements_created.append(statement.id)
                 
@@ -150,10 +163,10 @@ class ImportBankStatement(models.TransientModel):
                 print(e)
                 continue  # skip malformed rows
 
-        if duplicates > 0:
-            raise ValidationError(_("Найдено %d дубликатов. Импорт отменён") % duplicates)
+        #if duplicates > 0:
+        #    raise ValidationError(_("Найдено %d дубликатов. Импорт отменён") % duplicates)
         
-        if not statements_created:
+        if not statements_created and not duplicates:
             raise ValidationError(_("Не найдены верные транзакции в файле"))
         
         return {
@@ -181,6 +194,7 @@ class ImportBankStatement(models.TransientModel):
                     "beneficiary_bank_code": columns[4],
                     "beneficiary_account": columns[5],
                     "beneficiary_currency": columns[6],
+                    "beneficiary_name": "",
                     "payment_purpose_code": columns[7],
                     "payment_code": columns[8],
                     "reserved": columns[9],
@@ -197,3 +211,73 @@ class ImportBankStatement(models.TransientModel):
                 transactions.append(data)
 
         return transactions
+
+    def _parse_swift_statement(self, statement):
+        reading_transaction = False
+        transactions = []
+        
+        for line in statement.splitlines():
+            if line.startswith(":61:") and not reading_transaction:
+                # formatting:
+                # :61:xxxxxxDyyy,yyNTRFzzz//
+                # where x = date (first 6 digits in ddmmyy format)
+                #       D/C = debit/credit
+                #       y = sum (any amount of digits)
+                #       z = document number (three digits?)
+        
+                data = {
+                        #"type": colType,
+                        "date": "",
+                        "client_account": "",
+                        "currency": "",
+                        "beneficiary_bank_code": "",
+                        "beneficiary_account": "",
+                        "beneficiary_currency": "",
+                        "beneficiary_name": "",
+                        "payment_purpose_code": "",
+                        "payment_code": "",
+                        "reserved": "",
+                        "document_type": "",
+                        "document_id": "",
+                        "payer_tax_id": "",
+                        "tax_id_of_whom_paid": "",
+                        "debit_credit": "",
+                        "sum": "",
+                        "exchange_rate": "",
+                        "sum_byn": "",
+                        "payment_purpose": ""
+                }
+        
+                reading_transaction = True
+                line = line[4:]
+        
+                data["date"] = line[:6]
+                data["debit_credit"] = line[6]
+                data["sum_byn"], data["document_id"] = line[7:-2].split("NTRF")
+        
+            if reading_transaction:
+                kind = line[:4] if line.startswith(':') else line[:3]
+                line = line[4:] if kind.startswith(':') else line[3:]
+                match kind:
+                    case "?00":
+                        data["payment_purpose"] = line
+                    case "?10":
+                        data["payer_tax_id"] = line
+                    case "?30":
+                        data["beneficiary_bank_code"] = line
+                    case "?31":
+                        data["beneficiary_account"] = line
+                    case "?32":
+                        data["beneficiary_name"] = line
+                        transactions.append(data)
+                        reading_transaction = False
+
+        return transactions
+
+    def _detect_statement_type(self, data):
+        lines = data.splitlines()
+        if lines[0][0] == '*':
+            return 'txt'
+        elif lines[0].startswith(":20:"):
+            return 'swift'
+    
