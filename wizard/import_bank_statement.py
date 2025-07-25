@@ -69,6 +69,7 @@ class ImportBankStatement(models.TransientModel):
                 beneficiary_name = row.get('beneficiary_name', '')
                 payment_purpose = row.get('payment_purpose', '')
                 document_id = row.get('document_id', '')
+                tax_id = row.get('payer_tax_id', '')
 
                 existing_line = self.env['account.bank.statement.line'].search([
                     ('date', '=', transaction_date),
@@ -89,46 +90,43 @@ class ImportBankStatement(models.TransientModel):
                     continue  # skip this transaction 
                 
                 # determine if debit or credit
-                if row.get('debit_credit') == '1':  # assuming 1 = debit, 0 = credit
+                if row.get('debit_credit') == '1' or row.get('debit_credit') == 'D':  # assuming 1 = debit, 0 = credit
                     amount = -abs(amount)
                 else:
                     amount = abs(amount)
                 
                 # find or create partner bank account
+                partner = None
+                if tax_id:
+                    partner = self.env['res.partner'].search([
+                        ('vat', '=', tax_id)
+                    ], limit=1)
+                
+                if not partner:
+                    # create partner with tax id
+                    partner_name = beneficiary_name or f"Партнёр {tax_id or beneficiary_account}"
+                    partner = self.env['res.partner'].create({
+                        'name': partner_name,
+                        'vat': tax_id,
+                        'is_company': True,
+                        'supplier_rank': 1,
+                    })
+                                
+                # find or create bank account for this partner
                 partner_bank = self.env['res.partner.bank'].search([
-                    ('acc_number', '=', beneficiary_account)
+                    ('acc_number', '=', beneficiary_account),
+                    ('partner_id', '=', partner.id)
                 ], limit=1)
-                
+                                
                 if not partner_bank:
-                    # create a generic partner if none exists
-
-                    if beneficiary_name != "":
-                        partner_name = beneficiary_name
-                    else:
-                        partner_name = f"Партнёр {beneficiary_account}"
-                    
-                    try:
-                        partner = self.env['res.partner'].create({
-                            'name': partner_name,
-                            'is_company': True,
-                            'supplier_rank': 1,
-                        })
-
-                        print(partner.id)
-                        
-                        # create the bank account
-                        partner_bank = self.env['res.partner.bank'].create({
-                            'acc_number': beneficiary_account,
-                            'partner_id': partner.id,
-                            'bank_name': beneficiary_bank_code or 'Неизвестный банк',
-                            'journal_id': None
-                        })
-
-                        print(partner_bank)
-                    except Exception as e:
-                        raise ValidationError(_(e))
-                
-                partner_id = partner_bank.partner_id.id
+                    partner_bank = self.env['res.partner.bank'].create({
+                        'acc_number': beneficiary_account,
+                        'partner_id': partner.id,
+                        'bank_name': beneficiary_bank_code or 'Неизвестный банк',
+                        'journal_id': None
+                    })
+                                
+                partner_id = partner.id
                 
                 # create bank statement
                 statement = self.env['account.bank.statement'].create({
