@@ -109,7 +109,7 @@ class ImportBankStatement(models.TransientModel):
                         'name': partner_name,
                         'vat': tax_id,
                         'is_company': True,
-                        'supplier_rank': 1,
+                        'customer_rank': 1,
                     })
                                 
                 # find or create bank account for this partner
@@ -174,6 +174,32 @@ class ImportBankStatement(models.TransientModel):
             'res_model': 'account.bank.statement',
             'domain': [('id', 'in', statements_created)],
         }
+
+    def _create_payment_from_statement_line(self, statement_line, partner):
+        """create actual payment record from statement line"""
+        payment_method = self.env.ref('account.account_payment_method_manual_in') if statement_line.amount > 0 else self.env.ref('account.account_payment_method_manual_out')
+        
+        payment_vals = {
+            'payment_type': 'inbound' if statement_line.amount > 0 else 'outbound',
+            'partner_type': 'customer' if statement_line.amount > 0 else 'supplier',
+            'partner_id': partner.id,
+            'amount': abs(statement_line.amount),
+            'journal_id': self.journal_id.id,
+            'date': statement_line.date,
+            'ref': statement_line.payment_ref,
+            'payment_method_id': payment_method.id,
+        }
+        
+        payment = self.env['account.payment'].create(payment_vals)
+        payment.action_post()  # post the payment to create journal entries
+        
+        # link the payment to the statement line
+        statement_line.write({
+            'payment_id': payment.id,
+            'is_reconciled': True,
+        })
+        
+        return payment
 
     def _parse_txt_statement(self, statement):
         transactions = []
