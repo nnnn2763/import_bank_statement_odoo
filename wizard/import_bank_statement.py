@@ -54,6 +54,7 @@ class ImportBankStatement(models.TransientModel):
             raise ValidationError(_("Ошибка при прочтении TXT файла: %s") % str(e))
         
         statements_created = []
+        payments_created = []
         duplicates = 0
         # sort rows by ascending date
         rows.sort(key=lambda x:x['date'])
@@ -127,22 +128,26 @@ class ImportBankStatement(models.TransientModel):
                     })
                                 
                 partner_id = partner.id
-                
+
                 # create bank statement
                 statement = self.env['account.bank.statement'].create({
                     'name': f"Импорт {beneficiary_account}",
-                    #'balance_start': balance_end,
-                    'line_ids': [
-                        (0, 0, {
-                            'date': transaction_date,
-                            'payment_ref': f"{document_id} - {payment_purpose}" or 'csv import',
-                            'partner_id': partner_id,
-                            'journal_id': self.journal_id.id,
-                            'amount': amount,
-                            'narration': f"Валюта: {currency}, Аккаунт: {beneficiary_account}",
-                        }),
-                    ],
+                    'journal_id': self.journal_id.id,
+                    'date': transaction_date,
                 })
+            
+                # create statement line
+                line_vals = {
+                    'statement_id': statement.id,
+                    'date': transaction_date,
+                    'payment_ref': f"{document_id} - {payment_purpose}" or 'Импорт',
+                    'partner_id': partner_id,
+                    'amount': amount,
+                    'narration': f"Валюта: {currency}, Аккаунт: {beneficiary_account}",
+                }
+
+                statement_line = self.env['account.bank.statement.line'].create(line_vals)
+
                 previous_statement = self.env['account.bank.statement'].search(
                     [
                         ('journal_id', '=', self.journal_id.id),
@@ -153,9 +158,12 @@ class ImportBankStatement(models.TransientModel):
                 )
                 balance_end = previous_statement.balance_end_real or 0.0
                 statement.balance_start = balance_end
-                
+
                 statement._compute_balance_end()
                 statements_created.append(statement.id)
+
+                payment = self._create_payment_from_statement_line(statement_line, partner)
+                payments_created.append(payment.id)
                 
             except (ValueError, KeyError) as e:
                 print(e)
@@ -194,10 +202,10 @@ class ImportBankStatement(models.TransientModel):
         payment.action_post()  # post the payment to create journal entries
         
         # link the payment to the statement line
-        statement_line.write({
-            'payment_id': payment.id,
-            'is_reconciled': True,
-        })
+        #statement_line.write({
+        #    'payment_id': payment.id,
+        #    'is_reconciled': True,
+        #})
         
         return payment
 
